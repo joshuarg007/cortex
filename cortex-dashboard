@@ -1,0 +1,4 @@
+#!/bin/bash
+# Cortex Dashboard Launcher
+cd ~/.claude/cortex
+exec ~/.claude/cortex/venv/bin/python3 -m app.main "$@"
