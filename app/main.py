@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QTextEdit, QSplitter, QFrame, QScrollArea,
     QGridLayout, QProgressBar, QMessageBox
 )
-from PyQt6.QtCore import Qt, QTimer, QSize
+from PyQt6.QtCore import Qt, QTimer, QSize, QCoreApplication
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QAction
 
 # Brain icon as SVG
@@ -40,19 +40,30 @@ BRAIN_SVG = '''<?xml version="1.0" encoding="UTF-8"?>
 
 
 def create_brain_icon():
-    """Create brain icon from SVG"""
-    from PyQt6.QtSvg import QSvgRenderer
-    from PyQt6.QtCore import QByteArray
+    """Create brain icon - try theme first for GNOME compatibility"""
+    # Try theme icon first (works best with GNOME AppIndicator)
+    theme_icon = QIcon.fromTheme("cortex")
+    if not theme_icon.isNull():
+        return theme_icon
 
-    pixmap = QPixmap(64, 64)
-    pixmap.fill(Qt.GlobalColor.transparent)
+    # Try PNG files
+    icon = QIcon()
+    app_dir = Path(__file__).parent
 
-    painter = QPainter(pixmap)
-    renderer = QSvgRenderer(QByteArray(BRAIN_SVG.encode()))
-    renderer.render(painter)
-    painter.end()
+    for size in [16, 22, 24, 32, 48, 64, 128]:
+        png_path = app_dir / f"icon-{size}.png"
+        if png_path.exists():
+            icon.addFile(str(png_path), QSize(size, size))
 
-    return QIcon(pixmap)
+    if not icon.isNull():
+        return icon
+
+    # Final fallback to SVG
+    svg_path = app_dir / "icon.svg"
+    if svg_path.exists():
+        return QIcon(str(svg_path))
+
+    return QIcon()
 
 
 class StatsCard(QFrame):
@@ -256,6 +267,69 @@ class DashboardWindow(QMainWindow):
         search_layout.addWidget(self.search_results)
         tabs.addTab(search_widget, "🔍 Semantic Search")
 
+        # About tab
+        about_widget = QWidget()
+        about_layout = QVBoxLayout(about_widget)
+        about_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        about_content = QLabel(f"""
+<div style="padding: 20px; color: #CDD6F4;">
+    <h1 style="color: #8B5CF6; margin-bottom: 5px;">🧠 Cortex</h1>
+    <p style="color: #A6ADC8; font-size: 14px; margin-top: 0;">Persistent Memory System for Claude Code</p>
+
+    <h3 style="color: #CDD6F4; margin-top: 25px;">What is Cortex?</h3>
+    <p style="color: #BAC2DE; line-height: 1.6;">
+        Cortex is an intelligent memory layer that provides persistent knowledge storage,
+        semantic search, and automatic context injection for AI-assisted development workflows.
+        It remembers your learnings, tracks patterns, and surfaces relevant insights automatically.
+    </p>
+
+    <h3 style="color: #CDD6F4; margin-top: 20px;">How It Works</h3>
+    <p style="color: #BAC2DE; line-height: 1.6;">
+        <b>• Knowledge Base:</b> SQLite-backed storage for projects, learnings, secrets, and decisions<br>
+        <b>• Semantic Search:</b> Fast embeddings (bge-small-en) with &lt;1ms cached lookups<br>
+        <b>• Entity Extraction:</b> Auto-detects IPs, domains, CVEs, vulnerabilities from tool outputs<br>
+        <b>• Knowledge Graph:</b> NetworkX-powered relationship mapping between entities<br>
+        <b>• RAG Injection:</b> Automatic context injection at session start via hooks<br>
+        <b>• System Tray:</b> Always-accessible dashboard with quick actions
+    </p>
+
+    <h3 style="color: #CDD6F4; margin-top: 20px;">Technology Stack</h3>
+    <p style="color: #BAC2DE; line-height: 1.6;">
+        PyQt6 • SQLite • FastEmbed • NetworkX • ONNX Runtime • Python 3.12
+    </p>
+
+    <h3 style="color: #CDD6F4; margin-top: 20px;">Version Information</h3>
+    <table style="color: #BAC2DE; margin-top: 10px;">
+        <tr><td style="padding-right: 20px;">Cortex Core:</td><td><b>v3.0.0</b></td></tr>
+        <tr><td>Dashboard:</td><td><b>v1.0.0</b></td></tr>
+        <tr><td>Embedding Model:</td><td>BAAI/bge-small-en-v1.5</td></tr>
+    </table>
+
+    <h3 style="color: #CDD6F4; margin-top: 25px;">Support</h3>
+    <p style="color: #BAC2DE;">
+        For support requests, bug reports, or feature suggestions:<br>
+        <a href="mailto:labs@axiondeep.com" style="color: #8B5CF6;">labs@axiondeep.com</a>
+    </p>
+
+    <p style="color: #6C7086; margin-top: 30px; font-size: 12px;">
+        © 2025 Axion Deep Labs Inc. All rights reserved.
+    </p>
+</div>
+        """)
+        about_content.setWordWrap(True)
+        about_content.setTextFormat(Qt.TextFormat.RichText)
+        about_content.setOpenExternalLinks(True)
+        about_content.setStyleSheet("background-color: #1E1E2E; border-radius: 8px;")
+
+        about_scroll = QScrollArea()
+        about_scroll.setWidget(about_content)
+        about_scroll.setWidgetResizable(True)
+        about_scroll.setStyleSheet("QScrollArea { border: none; background-color: #1E1E2E; }")
+
+        about_layout.addWidget(about_scroll)
+        tabs.addTab(about_widget, "ℹ️ About")
+
         layout.addWidget(tabs)
 
     def apply_dark_theme(self):
@@ -374,12 +448,27 @@ class CortexTrayApp:
 
     def __init__(self):
         self.app = QApplication(sys.argv)
+
+        # Create dashboard window first
+        self.dashboard = DashboardWindow()
+
+        # Check if system tray is available
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            print("System tray not available, running in window mode")
+            self.app.setQuitOnLastWindowClosed(True)
+            self.tray = None
+            self.dashboard.show()
+            return
+
         self.app.setQuitOnLastWindowClosed(False)
 
         # Create tray icon
         self.tray = QSystemTrayIcon()
         self.tray.setIcon(create_brain_icon())
         self.tray.setToolTip("Cortex - Persistent Memory")
+
+        # Show dashboard on first launch
+        self.dashboard.show()
 
         # Create menu
         menu = QMenu()
@@ -406,11 +495,9 @@ class CortexTrayApp:
 
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self.on_tray_activated)
-
-        # Create dashboard window
-        self.dashboard = DashboardWindow()
-
         self.tray.show()
+
+        print("Cortex Dashboard started - check system tray")
 
     def show_dashboard(self):
         self.dashboard.show()
@@ -448,7 +535,8 @@ Patterns: {stats.get('patterns', 0)}
             self.show_dashboard()
 
     def quit(self):
-        self.tray.hide()
+        if self.tray:
+            self.tray.hide()
         self.app.quit()
 
     def run(self):
