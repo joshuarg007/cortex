@@ -1,27 +1,66 @@
 #!/usr/bin/env python3
 """
-Cortex Dashboard - System Tray Application
-Fast access to your persistent memory system.
+Cortex v3.0 - Unified Dashboard
+Single-instance GUI with system tray integration.
 """
 
 import sys
 import os
+import fcntl
 from pathlib import Path
 
 # Add cortex to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# Single instance lock
+LOCK_FILE = Path.home() / ".claude/cortex/.gui.lock"
+
+def acquire_lock():
+    """Try to acquire single instance lock. Returns lock fd or None."""
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lock_fd = open(LOCK_FILE, 'w')
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_fd.write(str(os.getpid()))
+        lock_fd.flush()
+        return lock_fd
+    except (IOError, OSError):
+        return None
+
+def get_running_pid():
+    """Get PID of running instance if any."""
+    try:
+        if LOCK_FILE.exists():
+            return int(LOCK_FILE.read_text().strip())
+    except:
+        pass
+    return None
+
+def signal_existing_instance():
+    """Signal the existing instance to show itself."""
+    import socket
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(str(Path.home() / ".claude/cortex/.gui.sock"))
+        sock.send(b"SHOW")
+        sock.close()
+        return True
+    except:
+        return False
+
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QSystemTrayIcon, QMenu,
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
     QLabel, QPushButton, QTableWidget, QTableWidgetItem,
-    QLineEdit, QTextEdit, QSplitter, QFrame, QScrollArea,
-    QGridLayout, QProgressBar, QMessageBox
+    QLineEdit, QTextEdit, QFrame, QScrollArea,
+    QMessageBox, QCheckBox, QGroupBox
 )
-from PyQt6.QtCore import Qt, QTimer, QSize, QCoreApplication
-from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QAction
+from PyQt6.QtCore import Qt, QTimer, QSize, QThread, pyqtSignal
+from PyQt6.QtGui import QIcon, QAction
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
-# Brain icon as SVG
+
 BRAIN_SVG = '''<?xml version="1.0" encoding="UTF-8"?>
 <svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
   <defs>
@@ -40,29 +79,23 @@ BRAIN_SVG = '''<?xml version="1.0" encoding="UTF-8"?>
 
 
 def create_brain_icon():
-    """Create brain icon - try theme first for GNOME compatibility"""
-    # Try theme icon first (works best with GNOME AppIndicator)
+    """Create brain icon"""
     theme_icon = QIcon.fromTheme("cortex")
     if not theme_icon.isNull():
         return theme_icon
 
-    # Try PNG files
     icon = QIcon()
     app_dir = Path(__file__).parent
-
     for size in [16, 22, 24, 32, 48, 64, 128]:
         png_path = app_dir / f"icon-{size}.png"
         if png_path.exists():
             icon.addFile(str(png_path), QSize(size, size))
-
     if not icon.isNull():
         return icon
 
-    # Final fallback to SVG
     svg_path = app_dir / "icon.svg"
     if svg_path.exists():
         return QIcon(str(svg_path))
-
     return QIcon()
 
 
@@ -87,15 +120,14 @@ class StatsCard(QFrame):
         title_label = QLabel(title)
         title_label.setStyleSheet("color: #A6ADC8; font-size: 12px;")
 
-        value_label = QLabel(value)
-        value_label.setObjectName("value")
-        value_label.setStyleSheet(f"color: {color}; font-size: 24px; font-weight: bold;")
+        self.value_label = QLabel(value)
+        self.value_label.setStyleSheet(f"color: {color}; font-size: 24px; font-weight: bold;")
 
         layout.addWidget(title_label)
-        layout.addWidget(value_label)
+        layout.addWidget(self.value_label)
 
     def set_value(self, value: str):
-        self.findChild(QLabel, "value").setText(value)
+        self.value_label.setText(value)
 
 
 class DashboardWindow(QMainWindow):
@@ -103,8 +135,8 @@ class DashboardWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cortex Dashboard")
-        self.setMinimumSize(900, 600)
+        self.setWindowTitle("Cortex v3.0")
+        self.setMinimumSize(900, 650)
         self.setup_ui()
         self.apply_dark_theme()
         self.load_data()
@@ -112,7 +144,7 @@ class DashboardWindow(QMainWindow):
         # Auto-refresh timer
         self.refresh_timer = QTimer()
         self.refresh_timer.timeout.connect(self.load_data)
-        self.refresh_timer.start(30000)  # Refresh every 30s
+        self.refresh_timer.start(10000)  # Refresh every 10s
 
     def setup_ui(self):
         central = QWidget()
@@ -121,41 +153,59 @@ class DashboardWindow(QMainWindow):
         layout.setSpacing(16)
         layout.setContentsMargins(16, 16, 16, 16)
 
-        # Header
+        # Header with power toggle
         header = QHBoxLayout()
-        title = QLabel("🧠 Cortex Dashboard")
+        title = QLabel("🧠 Cortex v3.0")
         title.setStyleSheet("font-size: 24px; font-weight: bold; color: #CDD6F4;")
         header.addWidget(title)
         header.addStretch()
 
-        refresh_btn = QPushButton("↻ Refresh")
+        # Power toggle
+        self.power_btn = QPushButton("⏸ DISABLED")
+        self.power_btn.setCheckable(True)
+        self.power_btn.clicked.connect(self.toggle_power)
+        self.update_power_button()
+        header.addWidget(self.power_btn)
+
+        refresh_btn = QPushButton("↻")
+        refresh_btn.setToolTip("Refresh")
         refresh_btn.clicked.connect(self.load_data)
         refresh_btn.setStyleSheet("""
             QPushButton {
                 background-color: #313244;
                 color: #CDD6F4;
                 border: none;
-                padding: 8px 16px;
+                padding: 8px 12px;
                 border-radius: 4px;
+                font-size: 16px;
             }
-            QPushButton:hover {
-                background-color: #45475A;
-            }
+            QPushButton:hover { background-color: #45475A; }
         """)
         header.addWidget(refresh_btn)
         layout.addLayout(header)
 
+        # Status bar
+        self.status_bar = QLabel("Loading...")
+        self.status_bar.setStyleSheet("""
+            background-color: #1E1E2E;
+            color: #A6ADC8;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+        """)
+        layout.addWidget(self.status_bar)
+
         # Stats cards
         stats_layout = QHBoxLayout()
-        self.projects_card = StatsCard("Projects", "0", "#8B5CF6")
-        self.learnings_card = StatsCard("Learnings", "0", "#22C55E")
-        self.embeddings_card = StatsCard("Embeddings", "0", "#3B82F6")
-        self.graph_card = StatsCard("Graph Nodes", "0", "#F59E0B")
+        self.instances_card = StatsCard("Claude Instances", "0", "#22C55E")
+        self.learnings_card = StatsCard("Learnings", "0", "#8B5CF6")
+        self.errors_card = StatsCard("Errors Tracked", "0", "#EF4444")
+        self.solutions_card = StatsCard("Solutions", "0", "#3B82F6")
 
-        stats_layout.addWidget(self.projects_card)
+        stats_layout.addWidget(self.instances_card)
         stats_layout.addWidget(self.learnings_card)
-        stats_layout.addWidget(self.embeddings_card)
-        stats_layout.addWidget(self.graph_card)
+        stats_layout.addWidget(self.errors_card)
+        stats_layout.addWidget(self.solutions_card)
         layout.addLayout(stats_layout)
 
         # Tabs
@@ -180,6 +230,47 @@ class DashboardWindow(QMainWindow):
             }
         """)
 
+        # Status tab
+        status_widget = QWidget()
+        status_layout = QVBoxLayout(status_widget)
+
+        # Settings group
+        settings_group = QGroupBox("Settings")
+        settings_group.setStyleSheet("""
+            QGroupBox {
+                color: #CDD6F4;
+                border: 1px solid #313244;
+                border-radius: 8px;
+                margin-top: 12px;
+                padding-top: 12px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+            }
+        """)
+        settings_layout = QVBoxLayout(settings_group)
+
+        self.auto_start_cb = QCheckBox("Auto-start Ollama with Claude")
+        self.auto_stop_cb = QCheckBox("Auto-stop Ollama when last Claude closes")
+        self.preload_cb = QCheckBox("Preload model into VRAM on start")
+
+        for cb in [self.auto_start_cb, self.auto_stop_cb, self.preload_cb]:
+            cb.setStyleSheet("color: #CDD6F4;")
+            cb.stateChanged.connect(self.save_settings)
+            settings_layout.addWidget(cb)
+
+        status_layout.addWidget(settings_group)
+
+        # System info
+        self.system_info = QLabel("Loading system info...")
+        self.system_info.setStyleSheet("color: #A6ADC8; padding: 12px;")
+        self.system_info.setWordWrap(True)
+        status_layout.addWidget(self.system_info)
+        status_layout.addStretch()
+
+        tabs.addTab(status_widget, "⚙️ Status")
+
         # Learnings tab
         self.learnings_table = QTableWidget()
         self.learnings_table.setColumnCount(4)
@@ -200,22 +291,6 @@ class DashboardWindow(QMainWindow):
             }
         """)
         tabs.addTab(self.learnings_table, "📚 Learnings")
-
-        # Projects tab
-        self.projects_table = QTableWidget()
-        self.projects_table.setColumnCount(3)
-        self.projects_table.setHorizontalHeaderLabels(["Name", "Path", "Tech Stack"])
-        self.projects_table.horizontalHeader().setStretchLastSection(True)
-        self.projects_table.setStyleSheet(self.learnings_table.styleSheet())
-        tabs.addTab(self.projects_table, "📁 Projects")
-
-        # Graph tab
-        graph_widget = QWidget()
-        graph_layout = QVBoxLayout(graph_widget)
-        self.graph_stats = QLabel("Loading graph stats...")
-        self.graph_stats.setStyleSheet("color: #CDD6F4; padding: 16px;")
-        graph_layout.addWidget(self.graph_stats)
-        tabs.addTab(graph_widget, "🕸️ Knowledge Graph")
 
         # Search tab
         search_widget = QWidget()
@@ -246,9 +321,7 @@ class DashboardWindow(QMainWindow):
                 padding: 8px 16px;
                 border-radius: 4px;
             }
-            QPushButton:hover {
-                background-color: #7C3AED;
-            }
+            QPushButton:hover { background-color: #7C3AED; }
         """)
         search_row.addWidget(search_btn)
         search_layout.addLayout(search_row)
@@ -265,152 +338,180 @@ class DashboardWindow(QMainWindow):
             }
         """)
         search_layout.addWidget(self.search_results)
-        tabs.addTab(search_widget, "🔍 Semantic Search")
+        tabs.addTab(search_widget, "🔍 Search")
 
-        # About tab
-        about_widget = QWidget()
-        about_layout = QVBoxLayout(about_widget)
-        about_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-
-        about_content = QLabel(f"""
-<div style="padding: 20px; color: #CDD6F4;">
-    <h1 style="color: #8B5CF6; margin-bottom: 5px;">🧠 Cortex</h1>
-    <p style="color: #A6ADC8; font-size: 14px; margin-top: 0;">Persistent Memory System for Claude Code</p>
-
-    <h3 style="color: #CDD6F4; margin-top: 25px;">What is Cortex?</h3>
-    <p style="color: #BAC2DE; line-height: 1.6;">
-        Cortex is an intelligent memory layer that provides persistent knowledge storage,
-        semantic search, and automatic context injection for AI-assisted development workflows.
-        It remembers your learnings, tracks patterns, and surfaces relevant insights automatically.
-    </p>
-
-    <h3 style="color: #CDD6F4; margin-top: 20px;">How It Works</h3>
-    <p style="color: #BAC2DE; line-height: 1.6;">
-        <b>• Knowledge Base:</b> SQLite-backed storage for projects, learnings, secrets, and decisions<br>
-        <b>• Semantic Search:</b> Fast embeddings (bge-small-en) with &lt;1ms cached lookups<br>
-        <b>• Entity Extraction:</b> Auto-detects IPs, domains, CVEs, vulnerabilities from tool outputs<br>
-        <b>• Knowledge Graph:</b> NetworkX-powered relationship mapping between entities<br>
-        <b>• RAG Injection:</b> Automatic context injection at session start via hooks<br>
-        <b>• System Tray:</b> Always-accessible dashboard with quick actions
-    </p>
-
-    <h3 style="color: #CDD6F4; margin-top: 20px;">Technology Stack</h3>
-    <p style="color: #BAC2DE; line-height: 1.6;">
-        PyQt6 • SQLite • FastEmbed • NetworkX • ONNX Runtime • Python 3.12
-    </p>
-
-    <h3 style="color: #CDD6F4; margin-top: 20px;">Version Information</h3>
-    <table style="color: #BAC2DE; margin-top: 10px;">
-        <tr><td style="padding-right: 20px;">Cortex Core:</td><td><b>v3.0.0</b></td></tr>
-        <tr><td>Dashboard:</td><td><b>v1.0.0</b></td></tr>
-        <tr><td>Embedding Model:</td><td>BAAI/bge-small-en-v1.5</td></tr>
-    </table>
-
-    <h3 style="color: #CDD6F4; margin-top: 25px;">Support</h3>
-    <p style="color: #BAC2DE;">
-        For support requests, bug reports, or feature suggestions:<br>
-        <a href="mailto:labs@axiondeep.com" style="color: #8B5CF6;">labs@axiondeep.com</a>
-    </p>
-
-    <p style="color: #6C7086; margin-top: 30px; font-size: 12px;">
-        © 2025 Axion Deep Labs Inc. All rights reserved.
-    </p>
-</div>
-        """)
-        about_content.setWordWrap(True)
-        about_content.setTextFormat(Qt.TextFormat.RichText)
-        about_content.setOpenExternalLinks(True)
-        about_content.setStyleSheet("background-color: #1E1E2E; border-radius: 8px;")
-
-        about_scroll = QScrollArea()
-        about_scroll.setWidget(about_content)
-        about_scroll.setWidgetResizable(True)
-        about_scroll.setStyleSheet("QScrollArea { border: none; background-color: #1E1E2E; }")
-
-        about_layout.addWidget(about_scroll)
-        tabs.addTab(about_widget, "ℹ️ About")
+        # Visualizations tab
+        try:
+            from app.visualizations import VisualizationDashboard
+            viz_dashboard = VisualizationDashboard()
+            tabs.addTab(viz_dashboard, "✨ Visualize")
+        except Exception as e:
+            viz_placeholder = QLabel(f"Visualizations unavailable: {e}")
+            viz_placeholder.setStyleSheet("color: #666666; padding: 20px;")
+            tabs.addTab(viz_placeholder, "✨ Visualize")
 
         layout.addWidget(tabs)
 
     def apply_dark_theme(self):
         self.setStyleSheet("""
-            QMainWindow {
-                background-color: #11111B;
-            }
-            QWidget {
-                font-family: 'Segoe UI', 'Ubuntu', sans-serif;
-            }
+            QMainWindow { background-color: #11111B; }
+            QWidget { font-family: 'Segoe UI', 'Ubuntu', sans-serif; }
         """)
+
+    def update_power_button(self):
+        try:
+            from instance_manager import is_enabled
+            enabled = is_enabled()
+        except:
+            enabled = True
+
+        if enabled:
+            self.power_btn.setText("✓ ENABLED")
+            self.power_btn.setChecked(True)
+            self.power_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #22C55E;
+                    color: white;
+                    border: none;
+                    padding: 8px 16px;
+                    border-radius: 4px;
+                    font-weight: bold;
+                }
+                QPushButton:hover { background-color: #16A34A; }
+            """)
+        else:
+            self.power_btn.setText("⏸ DISABLED")
+            self.power_btn.setChecked(False)
+            self.power_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #6B7280;
+                    color: white;
+                    border: none;
+                    padding: 8px 16px;
+                    border-radius: 4px;
+                    font-weight: bold;
+                }
+                QPushButton:hover { background-color: #4B5563; }
+            """)
+
+    def toggle_power(self):
+        try:
+            from instance_manager import is_enabled, set_enabled
+            current = is_enabled()
+            set_enabled(not current)
+            self.update_power_button()
+            self.load_data()
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to toggle: {e}")
+
+    def load_settings(self):
+        try:
+            from instance_manager import load_settings
+            settings = load_settings()
+            self.auto_start_cb.blockSignals(True)
+            self.auto_stop_cb.blockSignals(True)
+            self.preload_cb.blockSignals(True)
+
+            self.auto_start_cb.setChecked(settings.get('auto_start_ollama', True))
+            self.auto_stop_cb.setChecked(settings.get('auto_stop_ollama', True))
+            self.preload_cb.setChecked(settings.get('preload_models', False))
+
+            self.auto_start_cb.blockSignals(False)
+            self.auto_stop_cb.blockSignals(False)
+            self.preload_cb.blockSignals(False)
+        except:
+            pass
+
+    def save_settings(self):
+        try:
+            from instance_manager import load_settings, save_settings
+            settings = load_settings()
+            settings['auto_start_ollama'] = self.auto_start_cb.isChecked()
+            settings['auto_stop_ollama'] = self.auto_stop_cb.isChecked()
+            settings['preload_models'] = self.preload_cb.isChecked()
+            save_settings(settings)
+        except:
+            pass
 
     def load_data(self):
         """Load data from Cortex"""
+        self.update_power_button()
+        self.load_settings()
+
+        try:
+            from instance_manager import get_status, is_enabled
+            status = get_status()
+
+            instances = status.get('active_instances', 0)
+            ollama = "Yes" if status.get('ollama_running') else "No"
+            managed = "Yes" if status.get('ollama_managed') else "No"
+            enabled = "ENABLED" if is_enabled() else "DISABLED"
+
+            self.instances_card.set_value(str(instances))
+            self.status_bar.setText(
+                f"Cortex: {enabled} | Ollama: {ollama} | Managed by Cortex: {managed} | Instances: {instances}"
+            )
+
+        except Exception as e:
+            self.status_bar.setText(f"Status error: {e}")
+
         try:
             from knowledge_base import get_kb
-            from graph import get_graph
-            from rag import get_stats
-
             kb = get_kb()
             stats = kb.get_stats()
-
-            # Update stats cards
-            self.projects_card.set_value(str(stats.get('projects', 0)))
             self.learnings_card.set_value(str(stats.get('learnings', 0)))
 
-            # Embeddings count
-            rag_stats = get_stats()
-            self.embeddings_card.set_value(str(rag_stats.get('embeddings_cached', 0)))
-
-            # Graph stats
-            g = get_graph()
-            g_stats = g.get_stats()
-            self.graph_card.set_value(str(g_stats.get('total_nodes', 0)))
-
-            # Load learnings
             learnings = kb.get_learnings(limit=50)
             self.learnings_table.setRowCount(len(learnings))
             for i, l in enumerate(learnings):
                 self.learnings_table.setItem(i, 0, QTableWidgetItem(l.get('category', '')))
                 self.learnings_table.setItem(i, 1, QTableWidgetItem(l.get('content', '')[:100]))
                 self.learnings_table.setItem(i, 2, QTableWidgetItem(str(l.get('importance', 0))))
-                self.learnings_table.setItem(i, 3, QTableWidgetItem(l.get('created_at', '')[:10]))
-
-            # Load projects
-            import sqlite3
-            conn = sqlite3.connect(str(Path.home() / ".claude/cortex/knowledge.db"))
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute("SELECT name, path, tech_stack FROM projects LIMIT 50")
-            projects = cursor.fetchall()
-            conn.close()
-
-            self.projects_table.setRowCount(len(projects))
-            for i, p in enumerate(projects):
-                self.projects_table.setItem(i, 0, QTableWidgetItem(p['name'] or ''))
-                self.projects_table.setItem(i, 1, QTableWidgetItem(p['path'] or ''))
-                self.projects_table.setItem(i, 2, QTableWidgetItem(p['tech_stack'] or ''))
-
-            # Graph stats display
-            self.graph_stats.setText(f"""
-Knowledge Graph Statistics:
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Total Nodes: {g_stats.get('total_nodes', 0)}
-Total Edges: {g_stats.get('total_edges', 0)}
-Density: {g_stats.get('density', 0):.4f}
-
-Node Types:
-{self._format_dict(g_stats.get('node_types', {}))}
-
-Edge Types:
-{self._format_dict(g_stats.get('edge_types', {}))}
-            """)
+                self.learnings_table.setItem(i, 3, QTableWidgetItem(l.get('created_at', '')[:10] if l.get('created_at') else ''))
 
         except Exception as e:
-            print(f"Error loading data: {e}")
+            pass
 
-    def _format_dict(self, d: dict) -> str:
-        if not d:
-            return "  (none)"
-        return "\n".join(f"  • {k}: {v}" for k, v in d.items())
+        try:
+            from intelligence.error_linker import get_error_linker
+            linker = get_error_linker()
+            error_stats = linker.get_stats()
+            self.errors_card.set_value(str(error_stats.get('total_errors', 0)))
+            self.solutions_card.set_value(str(error_stats.get('total_solutions', 0)))
+        except:
+            pass
+
+        try:
+            from models.resource_monitor import get_monitor
+            from models.ollama_client import get_client
+
+            monitor = get_monitor()
+            stats = monitor.get_stats()
+
+            gpu_info = "N/A"
+            if stats.gpu:
+                gpu_info = f"{stats.gpu.name} | {stats.gpu.temp_c}°C | VRAM: {stats.gpu.vram_percent:.0f}%"
+
+            ram_info = f"RAM: {stats.ram.used_gb:.1f}/{stats.ram.total_gb:.1f} GB"
+
+            client = get_client()
+            models_info = "Ollama: Not running"
+            if client.is_available():
+                models = client.list_models()
+                model_names = [m.get('name', '?') for m in models]
+                models_info = f"Models: {', '.join(model_names)}" if models else "Models: None installed"
+
+            self.system_info.setText(f"""
+System Information:
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+GPU: {gpu_info}
+{ram_info}
+{models_info}
+
+Log: ~/.claude/cortex/instance_manager.log
+            """)
+        except Exception as e:
+            self.system_info.setText(f"System info error: {e}")
 
     def do_search(self):
         """Perform semantic search"""
@@ -421,16 +522,26 @@ Edge Types:
         self.search_results.setText("Searching...")
 
         try:
-            from embeddings import semantic_search_db
-            results = semantic_search_db(query, table="learnings", top_k=10)
+            from models.ollama_client import get_client
+            from index.faiss_index import get_index
+
+            client = get_client()
+            index = get_index()
+
+            embedding = client.embed(query)
+            if not embedding:
+                self.search_results.setText("Failed to generate embedding. Is Ollama running?")
+                return
+
+            results = index.search(embedding, k=10)
 
             if not results:
                 self.search_results.setText("No results found.")
                 return
 
             text = f"Results for: {query}\n{'━' * 40}\n\n"
-            for id_, content, score in results:
-                text += f"[Score: {score:.3f}]\n{content[:200]}...\n\n"
+            for r in results:
+                text += f"[Score: {r.score:.3f}] [{r.content_type}]\n{r.content[:200]}...\n\n"
 
             self.search_results.setText(text)
 
@@ -439,38 +550,45 @@ Edge Types:
 
     def closeEvent(self, event):
         """Minimize to tray instead of closing"""
-        event.ignore()
-        self.hide()
+        if hasattr(self, 'tray') and self.tray:
+            event.ignore()
+            self.hide()
+        else:
+            event.accept()
 
 
-class CortexTrayApp:
-    """System tray application"""
+class CortexApp:
+    """Main application with system tray"""
 
     def __init__(self):
         self.app = QApplication(sys.argv)
-
-        # Create dashboard window first
-        self.dashboard = DashboardWindow()
-
-        # Check if system tray is available
-        if not QSystemTrayIcon.isSystemTrayAvailable():
-            print("System tray not available, running in window mode")
-            self.app.setQuitOnLastWindowClosed(True)
-            self.tray = None
-            self.dashboard.show()
-            return
-
+        self.app.setApplicationName("Cortex")
         self.app.setQuitOnLastWindowClosed(False)
 
-        # Create tray icon
-        self.tray = QSystemTrayIcon()
-        self.tray.setIcon(create_brain_icon())
-        self.tray.setToolTip("Cortex - Persistent Memory")
+        # Single instance server
+        self.server = QLocalServer()
+        self.server.removeServer("cortex-gui")
+        self.server.listen("cortex-gui")
+        self.server.newConnection.connect(self.on_new_connection)
 
-        # Show dashboard on first launch
+        # Create dashboard
+        self.dashboard = DashboardWindow()
+
+        # System tray
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.setup_tray()
+            self.dashboard.tray = self.tray
+        else:
+            self.tray = None
+            self.app.setQuitOnLastWindowClosed(True)
+
         self.dashboard.show()
 
-        # Create menu
+    def setup_tray(self):
+        self.tray = QSystemTrayIcon()
+        self.tray.setIcon(create_brain_icon())
+        self.tray.setToolTip("Cortex v3.0")
+
         menu = QMenu()
 
         show_action = QAction("📊 Open Dashboard", menu)
@@ -479,13 +597,9 @@ class CortexTrayApp:
 
         menu.addSeparator()
 
-        stats_action = QAction("📈 Quick Stats", menu)
-        stats_action.triggered.connect(self.show_quick_stats)
-        menu.addAction(stats_action)
-
-        search_action = QAction("🔍 Quick Search", menu)
-        search_action.triggered.connect(self.show_search)
-        menu.addAction(search_action)
+        toggle_action = QAction("⚡ Toggle Cortex", menu)
+        toggle_action.triggered.connect(self.toggle_cortex)
+        menu.addAction(toggle_action)
 
         menu.addSeparator()
 
@@ -497,44 +611,35 @@ class CortexTrayApp:
         self.tray.activated.connect(self.on_tray_activated)
         self.tray.show()
 
-        print("Cortex Dashboard started - check system tray")
+    def on_new_connection(self):
+        """Handle connection from another instance"""
+        socket = self.server.nextPendingConnection()
+        if socket:
+            socket.readyRead.connect(lambda: self.handle_socket(socket))
+
+    def handle_socket(self, socket):
+        """Show window when signaled by another instance"""
+        data = socket.readAll().data().decode()
+        if data == "SHOW":
+            self.show_dashboard()
+        socket.close()
 
     def show_dashboard(self):
         self.dashboard.show()
+        self.dashboard.raise_()
         self.dashboard.activateWindow()
 
-    def show_quick_stats(self):
-        try:
-            from knowledge_base import get_kb
-            kb = get_kb()
-            stats = kb.get_stats()
-
-            msg = QMessageBox()
-            msg.setWindowTitle("Cortex Stats")
-            msg.setText(f"""
-Projects: {stats.get('projects', 0)}
-Learnings: {stats.get('learnings', 0)}
-Decisions: {stats.get('decisions', 0)}
-Patterns: {stats.get('patterns', 0)}
-            """)
-            msg.setIcon(QMessageBox.Icon.Information)
-            msg.exec()
-        except Exception as e:
-            QMessageBox.warning(None, "Error", str(e))
-
-    def show_search(self):
-        self.dashboard.show()
-        self.dashboard.activateWindow()
-        # Switch to search tab
-        tabs = self.dashboard.centralWidget().findChild(QTabWidget)
-        if tabs:
-            tabs.setCurrentIndex(3)  # Search tab
+    def toggle_cortex(self):
+        self.dashboard.toggle_power()
 
     def on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self.show_dashboard()
+        elif reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.show_dashboard()
 
     def quit(self):
+        self.server.close()
         if self.tray:
             self.tray.hide()
         self.app.quit()
@@ -544,7 +649,19 @@ Patterns: {stats.get('patterns', 0)}
 
 
 def main():
-    app = CortexTrayApp()
+    # Check for existing instance
+    socket = QLocalSocket()
+    socket.connectToServer("cortex-gui")
+    if socket.waitForConnected(500):
+        # Already running, signal it to show
+        socket.write(b"SHOW")
+        socket.waitForBytesWritten(1000)
+        socket.close()
+        print("Cortex is already running. Bringing to front.")
+        sys.exit(0)
+    socket.close()
+
+    app = CortexApp()
     sys.exit(app.run())
 
 
